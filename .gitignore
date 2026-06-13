@@ -1,0 +1,48 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Credentials & private configurations
+.env
+
+# Runtime data (auto-generated)
+data/
+decrypted_save.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Distribution & build
+build/
+dist/
+*.egg-info/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# External & Cache Analysis
+graphify-out/
+referensi/
+
+# Internal Documentation
+*.md
+!README.md
+!CHANGELOG.md
+!docs/**/*.md
+!CONTRIBUTING.md
+
+# Local Documentation (Private)
+docs-local/
