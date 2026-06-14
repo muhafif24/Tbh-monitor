@@ -34,7 +34,7 @@ load_dotenv()
 from src.database import init_db, add_item, get_all_items, get_last_price, save_price, get_item_count
 from src.worker import PriceWorker, ListingWorker
 
-ITEM = "Frozen Orb (Immortal) A"
+ITEM = "Composite Bow (Legendary) A"
 RESULTS = {"price_ok": 0, "price_err": 0, "listing_ok": False}
 
 stop_event = threading.Event()
@@ -82,7 +82,7 @@ def run():
         on_listing(*args)
         listing_done.set()
 
-    lw = ListingWorker([ITEM], _on_listing_wrap, stop_event, fetch_metadata=True)
+    lw = ListingWorker([ITEM], _on_listing_wrap, stop_event)
     lw.start()
     listing_done.wait(timeout=120)
     lw.join(timeout=5)

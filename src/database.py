@@ -1,8 +1,12 @@
 import os
+import json
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict
+
+log = logging.getLogger(__name__)
 
 _DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -22,6 +26,11 @@ def init_db() -> None:
     with closing(_connect()) as conn:
         with conn:
             conn.executescript("""
+                PRAGMA journal_mode=WAL;
+                PRAGMA synchronous=NORMAL;
+                PRAGMA cache_size=-8000;
+                PRAGMA temp_store=MEMORY;
+
                 CREATE TABLE IF NOT EXISTS tracked_items (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     name        TEXT    UNIQUE NOT NULL,
@@ -66,6 +75,15 @@ def init_db() -> None:
                     image_data BLOB NOT NULL,
                     cached_at  TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS market_history_cache (
+                    item_name    TEXT PRIMARY KEY,
+                    history_json TEXT NOT NULL,
+                    updated_at   TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_price_history_name_id
+                    ON price_history(item_name, id DESC);
             """)
         # Migrate existing databases that predate item_type / item_nameid columns
         for ddl in (
@@ -101,12 +119,20 @@ def remove_item(name: str) -> None:
             conn.execute("DELETE FROM tracked_items  WHERE name = ?",      (name,))
             conn.execute("DELETE FROM price_history  WHERE item_name = ?", (name,))
             conn.execute("DELETE FROM price_snapshots WHERE item_name = ?", (name,))
+            conn.execute("DELETE FROM market_history_cache WHERE item_name = ?", (name,))
 
 
 def get_all_items() -> list:
     with closing(_connect()) as conn:
         rows = conn.execute("SELECT * FROM tracked_items ORDER BY id").fetchall()
     return [dict(row) for row in rows]
+
+
+def get_item_by_name(name: str) -> Optional[dict]:
+    """Return a single tracked item by name, or None if not found."""
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT * FROM tracked_items WHERE name = ?", (name,)).fetchone()
+    return dict(row) if row else None
 
 
 def get_item_count() -> int:
@@ -310,6 +336,13 @@ def get_price_snapshot(item_name: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def get_all_price_snapshots() -> Dict[str, dict]:
+    """Return a dictionary mapping item_name to its price snapshot {ask, buy_highest, buy_count}."""
+    with closing(_connect()) as conn:
+        rows = conn.execute("SELECT item_name, ask, buy_highest, buy_count FROM price_snapshots").fetchall()
+    return {row["item_name"]: dict(row) for row in rows}
+
+
 # ── image_cache (static item art — never expires) ─────────────────────────────
 
 def get_uncached_item_images() -> List[dict]:
@@ -355,3 +388,68 @@ def save_cached_image(hash_name: str, image_data: bytes) -> None:
                 """,
                 (hash_name, image_data, now),
             )
+
+
+def save_market_history_cache(item_name: str, history: list) -> None:
+    """Save JSON-serialized history rows to the database cache."""
+    now = datetime.now().isoformat()
+    history_json = json.dumps(history)
+    with closing(_connect()) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO market_history_cache (item_name, history_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(item_name) DO UPDATE SET
+                    history_json=excluded.history_json,
+                    updated_at=excluded.updated_at
+                """,
+                (item_name, history_json, now),
+            )
+
+
+def get_all_market_history_cache() -> Dict[str, dict]:
+    """Batch-load all cached market histories in a single query.
+    Returns {item_name: {"history": list, "updated_at": str}}.
+    """
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT item_name, history_json, updated_at FROM market_history_cache"
+        ).fetchall()
+    result: Dict[str, dict] = {}
+    for row in rows:
+        try:
+            result[row["item_name"]] = {
+                "history": json.loads(row["history_json"]),
+                "updated_at": row["updated_at"],
+            }
+        except Exception as exc:
+            log.warning("Failed to decode cached history JSON for %s: %s", row["item_name"], exc)
+    return result
+
+
+def get_market_history_cache(item_name: str) -> Optional[dict]:
+    """
+    Retrieve cached history list and updated_at timestamp.
+    Returns: {"history": list, "updated_at": str} or None if not cached.
+    """
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT history_json, updated_at FROM market_history_cache WHERE item_name = ?",
+            (item_name,),
+        ).fetchone()
+    if row:
+        try:
+            history = json.loads(row["history_json"])
+            return {"history": history, "updated_at": row["updated_at"]}
+        except Exception as exc:
+            log.warning("Failed to decode cached history JSON for %s: %s", item_name, exc)
+    return None
+
+
+# ── Maintenance ───────────────────────────────────────────────────────────────
+
+def run_optimize() -> None:
+    """Run PRAGMA optimize to refresh query planner statistics. Call at app shutdown."""
+    with closing(_connect()) as conn:
+        conn.execute("PRAGMA optimize")

@@ -4,6 +4,7 @@ import time
 import logging
 import urllib.parse
 from typing import Optional
+from datetime import datetime, timezone
 import requests
 
 from . import config as _cfg
@@ -28,7 +29,7 @@ _HEADERS = {
 def _encode_name(name: str) -> str:
     if not name or not name.strip():
         raise ValueError("Item name must not be empty.")
-    return urllib.parse.quote_plus(name.strip()).replace("~", "%7E")
+    return urllib.parse.quote(name.strip()).replace("~", "%7E")
 
 
 def _get_retry_delay(response: requests.Response, tries: int) -> float:
@@ -217,32 +218,73 @@ class SteamMarketAPI:
         url = f"{BASE_URL}/listings/{APP_ID}/{encoded}"
         response = self._request(url)
 
-        result = {"history": [], "image_url": None, "item_nameid": None}
+        result = {
+            "history": [],
+            "image_url": None,
+            "name_color": None,
+            "item_type": None,
+            "item_nameid": None
+        }
         if response is None:
             return result
 
         html = response.text
 
-        m = re.search(r"var line1=(\[.*?\]);", html, re.DOTALL)
-        if m:
-            try:
-                history = json.loads(m.group(1))
-                result["history"] = history[-HISTORY_POINTS:]
-            except json.JSONDecodeError:
-                log.warning("Failed to parse line1 for item: %s", name)
+        # Extract and parse renderContext
+        start_str = 'window.SSR.renderContext=JSON.parse("'
+        start_idx = html.find(start_str)
+        if start_idx != -1:
+            end_script = html.find("</script>", start_idx)
+            if end_script != -1:
+                raw_block = html[start_idx + len(start_str):end_script].strip()
+                # Clean trailing JS characters
+                if raw_block.endswith(";"):
+                    raw_block = raw_block[:-1].strip()
+                if raw_block.endswith(")") and raw_block.endswith('")'):
+                    raw_block = raw_block[:-2]
 
+                try:
+                    # Unescape the JS-stringified JSON literal
+                    decoded = json.loads('"' + raw_block + '"')
+                    render_context = json.loads(decoded)
+                    
+                    query_data_str = render_context.get("queryData", "")
+                    if query_data_str:
+                        query_data = json.loads(query_data_str)
+                        queries = query_data.get("queries", [])
+                        for q in queries:
+                            q_key = q.get("queryKey")
+                            if not q_key:
+                                continue
+                            if "pricehistory" in q_key:
+                                prices = q.get("state", {}).get("data", {}).get("prices", [])
+                                history_list = []
+                                for entry in prices:
+                                    t = entry.get("time")
+                                    p = entry.get("price_median")
+                                    vol = entry.get("purchases")
+                                    # Convert Unix timestamp to date string expected by Matplotlib chart code
+                                    dt = datetime.fromtimestamp(t, timezone.utc)
+                                    date_str = dt.strftime("%b %d %Y 00:00:00 +00")
+                                    history_list.append([date_str, p, vol])
+                                result["history"] = history_list[-HISTORY_POINTS:]
+                            elif len(q_key) > 1 and q_key[0] == 'market' and q_key[1] == 'description':
+                                desc_data = q.get("state", {}).get("data", {})
+                                if isinstance(desc_data, dict):
+                                    raw_icon = desc_data.get("icon_url_large") or desc_data.get("icon_url")
+                                    if raw_icon:
+                                        result["image_url"] = f"https://community.fastly.steamstatic.com/economy/image/{raw_icon}/128x128"
+                                    if desc_data.get("name_color"):
+                                        result["name_color"] = desc_data.get("name_color")
+                                    if desc_data.get("type"):
+                                        result["item_type"] = desc_data.get("type")
+                except Exception as e:
+                    log.warning("Failed to parse renderContext for item %s: %s", name, e)
+
+        # Fallback image URL check just in case it is still in HTML
         m = re.search(r'<img[^>]+id="[^"]+_image"[^>]+src="([^"]+)"', html)
-        if m:
+        if m and not result["image_url"]:
             result["image_url"] = m.group(1)
-
-        m = re.search(r'Market\.LoadOrderSpread\(\s*(\d+)', html)
-        if m:
-            result["item_nameid"] = m.group(1)
-        else:
-            # Fallback pattern used on some Steam pages
-            m = re.search(r'CreateItemHistogram\(\s*(\d+)', html)
-            if m:
-                result["item_nameid"] = m.group(1)
 
         return result
 

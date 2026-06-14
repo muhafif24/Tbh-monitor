@@ -1,3 +1,4 @@
+import tkinter as tk
 from typing import Callable, List, Optional
 
 import customtkinter as ctk
@@ -13,6 +14,19 @@ _FILTER_ALL     = "All"
 _FILTER_OWNED   = "Owned"
 _FILTER_LISTING = "Listed"
 _FILTER_SOLDOUT = "Sold out"
+
+# Plain tk item rows — no internal tk.Canvas; much faster than CTkButton
+_BATCH_SIZE         = 100  # plain-tk rows are cheap, build more per tick
+_SEARCH_DEBOUNCE_MS = 150  # ms to wait after last keystroke before filtering
+
+# Color palette (matched to CTkScrollableFrame fg_color=("gray85","gray18"))
+_COLORS_DARK  = dict(row="#2e2e2e", hover="#474747", sel="#525252",
+                     sel_fg="#f0f0f0", txt_avail="#cccccc", txt_sold="#808080")
+_COLORS_LIGHT = dict(row="#d9d9d9", hover="#bfbfbf", sel="#a6a6a6",
+                     sel_fg="#1a1a1a", txt_avail="#262626", txt_sold="#808080")
+_ROW_FONT     = ("Segoe UI", 11)
+_DOT_FONT     = ("Segoe UI", 12)
+_OWN_FONT     = ("Segoe UI", 11, "bold")
 
 
 class AddItemDialog(ctk.CTkToplevel):
@@ -40,6 +54,7 @@ class AddItemDialog(ctk.CTkToplevel):
         catalog=None,
     ):
         super().__init__(parent)
+        self.attributes('-alpha', 0.0)
         self.title("Add Item")
         self.resizable(False, False)
         self.grab_set()
@@ -51,8 +66,19 @@ class AddItemDialog(ctk.CTkToplevel):
         self._catalog_dict  = {c.hash_name: c for c in self._catalog}
         self._text_mode     = not bool(self._catalog)
         self._selected: Optional[str] = None
-        self._item_buttons: list = []   # (CTkButton, hash_name, is_available, owned)
+        self._item_buttons: list = []   # (tk.Label btn, hash_name, is_available, owned)
         self._filter = _FILTER_ALL
+        self._search_after_id = None    # debounce timer id
+        self._loading_label   = None    # progress label during deferred build
+
+        # Resolve theme colors once (won't change while dialog is open)
+        _c = _COLORS_DARK if ctk.get_appearance_mode() == "Dark" else _COLORS_LIGHT
+        self._row_bg    = _c["row"]
+        self._row_hover = _c["hover"]
+        self._row_sel   = _c["sel"]
+        self._sel_fg    = _c["sel_fg"]
+        self._txt_avail = _c["txt_avail"]
+        self._txt_sold  = _c["txt_sold"]
 
         if self._text_mode:
             self.geometry("440x230")
@@ -62,6 +88,7 @@ class AddItemDialog(ctk.CTkToplevel):
             self._build_picker_ui()
 
         self._center_on(parent)
+        self.attributes('-alpha', 1.0)
 
     # ── Text-input fallback ───────────────────────────────────────────────────
 
@@ -154,10 +181,15 @@ class AddItemDialog(ctk.CTkToplevel):
         self._list_frame.grid(row=2, column=0, padx=16, pady=(0, 6), sticky="nsew")
         self._list_frame.grid_columnconfigure(0, weight=1)
 
-        for item in self._catalog:
-            is_available = getattr(item, "available", True)
-            owned = getattr(item, "owned", 0)
-            self._add_item_button(item.hash_name, item.item_type, is_available, owned)
+        if self._catalog:
+            self._loading_label = ctk.CTkLabel(
+                self._list_frame,
+                text="Loading items...",
+                font=ctk.CTkFont(size=11),
+                text_color="gray50",
+            )
+            self._loading_label.grid(row=0, column=0, pady=16)
+            self.after(0, lambda: self._deferred_build_list(0))
 
         # Row 3: legend + error
         legend_row = ctk.CTkFrame(self, fg_color="transparent")
@@ -175,11 +207,11 @@ class AddItemDialog(ctk.CTkToplevel):
         )
         self._error_label.grid(row=0, column=1, sticky="e")
 
-        # Row 4: manual input (collapsed by default, for sold-out items not in the list)
+        # Row 4: manual input (collapsed by default)
         self._manual_frame = ctk.CTkFrame(self, fg_color="transparent")
         self._manual_frame.grid(row=4, column=0, padx=16, pady=(0, 0), sticky="ew")
         self._manual_frame.grid_columnconfigure(1, weight=1)
-        self._manual_frame.grid_remove()   # hidden by default
+        self._manual_frame.grid_remove()
 
         ctk.CTkLabel(
             self._manual_frame, text="Name:",
@@ -218,65 +250,122 @@ class AddItemDialog(ctk.CTkToplevel):
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(right_btns, text="Add Item", width=100, command=self._on_add).pack(side="left")
 
-        # Initialize counter
-        self._update_counter(len(self._item_buttons))
+        self._update_counter(0)
 
     def _add_item_button(self, hash_name: str, item_type: str, is_available: bool, owned: int = 0):
-        """Create one row button for the scrollable list."""
+        """
+        Create one item row using plain tk widgets (tk.Frame + tk.Label).
+        Plain tk has no internal Canvas per widget — ~10x faster than CTkButton.
+        """
         dot, dot_color = _DOT_AVAILABLE if is_available else _DOT_SOLDOUT
-        type_str = item_type or ""
-        name_color = ("gray15", "gray80") if is_available else ("gray50", "gray50")
+        name_color     = self._txt_avail if is_available else self._txt_sold
+        row_bg         = self._row_bg
 
-        row_frame = ctk.CTkFrame(
-            self._list_frame, fg_color="transparent", height=30,
-        )
-        row_frame.pack(fill="x", padx=4, pady=1)
+        row_frame = tk.Frame(self._list_frame, bg=row_bg, height=30)
+        row_idx   = 1 + len(self._item_buttons)   # row 0 = loading_label slot
+        row_frame.grid(row=row_idx, column=0, sticky="ew", padx=4, pady=1)
         row_frame.grid_columnconfigure(1, weight=1)
         row_frame.grid_propagate(False)
 
-        # Availability dot
-        dot_label = ctk.CTkLabel(
-            row_frame, text=dot, font=ctk.CTkFont(size=12),
-            text_color=dot_color, width=18,
+        dot_lbl = tk.Label(
+            row_frame, text=dot, fg=dot_color, bg=row_bg,
+            font=_DOT_FONT, width=2,
         )
-        dot_label.grid(row=0, column=0, padx=(6, 2))
+        dot_lbl.grid(row=0, column=0, padx=(6, 2))
 
-        # Item name + type button
-        label = f"{hash_name}  ·  {type_str}" if type_str else hash_name
-        btn = ctk.CTkButton(
-            row_frame,
-            text=label,
-            anchor="w",
-            fg_color="transparent",
-            text_color=name_color,
-            hover_color=("gray75", "gray28"),
-            font=ctk.CTkFont(size=11),
-            height=28,
-            command=lambda n=hash_name: self._select(n),
+        label = f"{hash_name}  ·  {item_type}" if item_type else hash_name
+        btn = tk.Label(
+            row_frame, text=label, fg=name_color, bg=row_bg,
+            font=_ROW_FONT, anchor="w", cursor="hand2",
         )
         btn.grid(row=0, column=1, sticky="ew", padx=(0, 4))
 
-        # Owned badge (from savegame sync)
         if owned > 0:
-            owned_label = ctk.CTkLabel(
-                row_frame, text=f"×{owned}",
-                font=ctk.CTkFont(size=11, weight="bold"),
-                text_color=_OWNED_COLOR, width=36, anchor="e",
+            own_lbl = tk.Label(
+                row_frame, text=f"×{owned}", fg=_OWNED_COLOR, bg=row_bg,
+                font=_OWN_FONT, width=4, anchor="e",
             )
-            owned_label.grid(row=0, column=2, padx=(0, 8))
+            own_lbl.grid(row=0, column=2, padx=(0, 8))
+
+        # Hover + click bindings on all sub-widgets
+        hover_bg = self._row_hover
+        sel_bg   = self._row_sel
+
+        def _on_enter(e, hn=hash_name):
+            if self._selected == hn:
+                return
+            row_frame.configure(bg=hover_bg)
+            for w in row_frame.winfo_children():
+                w.configure(bg=hover_bg)
+
+        def _on_leave(e, hn=hash_name):
+            if self._selected == hn:
+                return
+            row_frame.configure(bg=row_bg)
+            for w in row_frame.winfo_children():
+                w.configure(bg=row_bg)
+
+        def _on_click(e, hn=hash_name):
+            self._select(hn)
+
+        for widget in (row_frame, dot_lbl, btn):
+            widget.bind("<Enter>",    _on_enter)
+            widget.bind("<Leave>",    _on_leave)
+            widget.bind("<Button-1>", _on_click)
 
         self._item_buttons.append((btn, hash_name, is_available, owned))
+
+    def _deferred_build_list(self, start_idx: int):
+        """Build _BATCH_SIZE item rows per after() tick, keeping the UI responsive."""
+        if not self.winfo_exists():
+            return
+        total   = len(self._catalog)
+        end_idx = min(start_idx + _BATCH_SIZE, total)
+
+        for i in range(start_idx, end_idx):
+            item = self._catalog[i]
+            self._add_item_button(
+                item.hash_name, item.item_type,
+                getattr(item, "available", True),
+                getattr(item, "owned", 0),
+            )
+
+        if end_idx < total:
+            if self._loading_label and self._loading_label.winfo_exists():
+                pct = int(end_idx / total * 100)
+                self._loading_label.configure(text=f"Loading items... {pct}%")
+            self.after(0, lambda: self._deferred_build_list(end_idx))
+        else:
+            if self._loading_label and self._loading_label.winfo_exists():
+                self._loading_label.grid_remove()
+                self._loading_label = None
+            self._apply_search_filter()
 
     # ── Selection ─────────────────────────────────────────────────────────────
 
     def _select(self, hash_name: str):
+        prev = self._selected
         self._selected = hash_name
-        for btn, name, available, _ow in self._item_buttons:
+
+        # Deselect previous
+        if prev and prev != hash_name:
+            for btn, name, available, _ in self._item_buttons:
+                if name == prev:
+                    nc = self._txt_avail if available else self._txt_sold
+                    f  = btn.master
+                    f.configure(bg=self._row_bg)
+                    for w in f.winfo_children(): w.configure(bg=self._row_bg)
+                    btn.configure(fg=nc)
+                    break
+
+        # Highlight new selection
+        for btn, name, _, _ in self._item_buttons:
             if name == hash_name:
-                btn.configure(fg_color=("gray65", "gray32"), text_color=("gray5", "white"))
-            else:
-                default = ("gray15", "gray80") if available else ("gray50", "gray50")
-                btn.configure(fg_color="transparent", text_color=default)
+                f = btn.master
+                f.configure(bg=self._row_sel)
+                for w in f.winfo_children(): w.configure(bg=self._row_sel)
+                btn.configure(fg=self._sel_fg)
+                break
 
     # ── Search / filter ───────────────────────────────────────────────────────
 
@@ -291,14 +380,23 @@ class AddItemDialog(ctk.CTkToplevel):
 
     def _on_filter_change(self, value: str):
         self._filter = value
-        self._on_search_change()
+        self._apply_search_filter()
 
     def _on_search_change(self, *_):
+        """Debounce: wait _SEARCH_DEBOUNCE_MS after last keystroke before filtering."""
+        if self._search_after_id:
+            self.after_cancel(self._search_after_id)
+        self._search_after_id = self.after(_SEARCH_DEBOUNCE_MS, self._apply_search_filter)
+
+    def _apply_search_filter(self):
+        """Apply current search query + filter to the item list."""
+        if not self.winfo_exists():
+            return
+        self._search_after_id = None
         query = self._search_var.get().lower().strip()
 
-        # Hide all row frames first (parent of each button)
         for btn, _, _a, _ow in self._item_buttons:
-            btn.master.pack_forget()
+            btn.master.grid_remove()
 
         visible = 0
         for btn, name, available, owned in self._item_buttons:
@@ -307,14 +405,18 @@ class AddItemDialog(ctk.CTkToplevel):
             cat      = self._catalog_dict.get(name)
             type_str = cat.item_type.lower() if cat else ""
             if not query or query in name.lower() or query in type_str:
-                btn.master.pack(fill="x", padx=4, pady=1)
+                btn.master.grid()
                 visible += 1
 
-        # Restore selection highlight if still visible
+        # Re-apply selection highlight if selected item is visible
         if self._selected:
-            for btn, name, _a, _ow in self._item_buttons:
+            for btn, name, _, _ in self._item_buttons:
                 if name == self._selected:
-                    btn.configure(fg_color=("gray65", "gray32"), text_color=("gray5", "white"))
+                    f = btn.master
+                    f.configure(bg=self._row_sel)
+                    for w in f.winfo_children(): w.configure(bg=self._row_sel)
+                    btn.configure(fg=self._sel_fg)
+                    break
 
         self._update_counter(visible, query)
 
@@ -325,9 +427,7 @@ class AddItemDialog(ctk.CTkToplevel):
         n_owned     = sum(1 for _, _, _av, ow in self._item_buttons if ow > 0)
 
         if query or self._filter != _FILTER_ALL:
-            self._counter_label.configure(
-                text=f"{visible} of {n_total} items"
-            )
+            self._counter_label.configure(text=f"{visible} of {n_total} items")
         else:
             parts = [f"{n_available} listed"]
             if n_soldout:
@@ -341,14 +441,18 @@ class AddItemDialog(ctk.CTkToplevel):
         if self._manual_frame.winfo_ismapped():
             self._manual_frame.grid_remove()
             self._link_manual.configure(text="Not in the list? Enter manually →")
-            self._selected = None   # clear manual selection when hiding
+            self._selected = None
         else:
             self._manual_frame.grid()
             self._link_manual.configure(text="↑ Close manual input")
-            self._selected = None   # deselect list item
-            for btn, _, available, _ow in self._item_buttons:
-                default = ("gray15", "gray80") if available else ("gray50", "gray50")
-                btn.configure(fg_color="transparent", text_color=default)
+            self._selected = None
+            # Reset all visible row colours
+            for btn, _, available, _ in self._item_buttons:
+                nc = self._txt_avail if available else self._txt_sold
+                f  = btn.master
+                f.configure(bg=self._row_bg)
+                for w in f.winfo_children(): w.configure(bg=self._row_bg)
+                btn.configure(fg=nc)
             self._manual_entry.focus()
 
     # ── Validation + confirm ──────────────────────────────────────────────────
@@ -360,7 +464,6 @@ class AddItemDialog(ctk.CTkToplevel):
                 self._show_error("Item name cannot be empty.")
                 return
         elif self._manual_frame.winfo_ismapped():
-            # Manual input mode (for sold-out items not in the list)
             name = self._manual_entry.get().strip()
             if not name:
                 self._show_error("Enter an item name.")

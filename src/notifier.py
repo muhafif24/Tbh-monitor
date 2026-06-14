@@ -53,8 +53,8 @@ def send_alert(item_name: str, current_price: float, alert_price: float) -> None
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
         log.info(
-            "Alert sent: %s — Rp %,.0f at or below threshold Rp %,.0f.",
-            item_name, current_price, alert_price,
+            "Alert sent: %s — %s %,.0f at or below threshold %s %,.0f.",
+            item_name, sym, current_price, sym, alert_price,
         )
     except Exception as exc:
         log.warning("Discord alert failed for %s: %s", item_name, exc)

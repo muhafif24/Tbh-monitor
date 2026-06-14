@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import threading
 import urllib.request
@@ -6,12 +7,13 @@ import customtkinter as ctk
 from datetime import datetime
 
 from ..database import (
-    get_all_items, add_item, remove_item,
+    get_all_items, get_item_by_name, add_item, remove_item,
     save_price, get_last_price, update_item_metadata, get_alert_price,
     clear_price_history, clear_price_snapshots, prune_price_history,
     replace_owned_items, get_all_seen_items, upsert_seen_items,
-    upsert_snapshot_ask, upsert_snapshot_buy, get_price_snapshot,
+    upsert_snapshot_ask, upsert_snapshot_buy, get_all_price_snapshots,
     get_cached_image, save_cached_image, get_uncached_item_images,
+    get_all_market_history_cache, run_optimize,
 )
 from ..worker import PriceWorker, ListingWorker, seconds_until_next_hour
 from ..notifier import send_alert
@@ -19,6 +21,7 @@ from .. import config as _cfg
 from .. import item_catalog
 from .. import save_reader
 from .. import item_mapping
+from .item_card import ItemCard
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -90,7 +93,7 @@ class MainWindow(ctk.CTk):
         self._btn_sync_save = ctk.CTkButton(
             header,
             text="⇄ Sync",
-            width=80,
+            width=70,
             fg_color="transparent",
             border_width=1,
             border_color=("gray60", "gray40"),
@@ -99,12 +102,54 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=12),
             command=self._on_sync_save,
         )
-        self._btn_sync_save.grid(row=0, column=3, padx=(0, 8), pady=10)
+        self._btn_sync_save.grid(row=0, column=3, padx=(0, 6), pady=10)
+
+        self._btn_export_save = ctk.CTkButton(
+            header,
+            text="📥 Export",
+            width=75,
+            fg_color="transparent",
+            border_width=1,
+            border_color=("gray60", "gray40"),
+            text_color=("gray20", "gray80"),
+            hover_color=("gray75", "gray28"),
+            font=ctk.CTkFont(size=12),
+            command=self._on_export_save,
+        )
+        self._btn_export_save.grid(row=0, column=4, padx=(0, 6), pady=10)
+
+        self._btn_browse_save = ctk.CTkButton(
+            header,
+            text="📁 Browse",
+            width=80,
+            fg_color="transparent",
+            border_width=1,
+            border_color=("gray60", "gray40"),
+            text_color=("gray20", "gray80"),
+            hover_color=("gray75", "gray28"),
+            font=ctk.CTkFont(size=12),
+            command=self._on_browse_save,
+        )
+        self._btn_browse_save.grid(row=0, column=5, padx=(0, 6), pady=10)
+
+        self._btn_save_inspector = ctk.CTkButton(
+            header,
+            text="🔍 Inspector",
+            width=85,
+            fg_color="transparent",
+            border_width=1,
+            border_color=("gray60", "gray40"),
+            text_color=("gray20", "gray80"),
+            hover_color=("gray75", "gray28"),
+            font=ctk.CTkFont(size=12),
+            command=self._on_open_save_inspector,
+        )
+        self._btn_save_inspector.grid(row=0, column=6, padx=(0, 6), pady=10)
 
         self._btn_refresh_catalog = ctk.CTkButton(
             header,
             text="↻ Catalog",
-            width=100,
+            width=85,
             fg_color="transparent",
             border_width=1,
             border_color=("gray60", "gray40"),
@@ -113,15 +158,16 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=12),
             command=self._on_refresh_catalog,
         )
-        self._btn_refresh_catalog.grid(row=0, column=4, padx=(0, 8), pady=10)
+        self._btn_refresh_catalog.grid(row=0, column=7, padx=(0, 6), pady=10)
 
         self._btn_add = ctk.CTkButton(
             header,
             text="+ Add Item",
-            width=120,
+            width=100,
             command=self._on_add_item,
         )
-        self._btn_add.grid(row=0, column=5, padx=(0, 20), pady=10, sticky="e")
+        self._btn_add.grid(row=0, column=8, padx=(0, 20), pady=10, sticky="e")
+
 
     def _build_scroll_area(self):
         self._scroll = ctk.CTkScrollableFrame(
@@ -161,21 +207,23 @@ class MainWindow(ctk.CTk):
         Catalog is loaded from local cache only (zero network).
         User can force a fresh catalog fetch via '↻ Catalog' button.
         """
-        pruned = prune_price_history(keep_days=90)
-        if pruned:
-            log.info("Pruned %d price history rows older than 90 days.", pruned)
+        # Prune old rows in background — no need to block UI for this
+        threading.Thread(
+            target=lambda: log.info("Pruned %d price history rows.", prune_price_history(90)),
+            daemon=True,
+        ).start()
 
         # Load catalog from local JSON cache (no network request)
         threading.Thread(target=self._load_catalog_cache_bg, daemon=True).start()
-
-        # Auto-sync savegame (local file read; items.json downloaded once if missing)
-        if save_reader.save_exists():
-            threading.Thread(target=self._sync_save_bg, daemon=True).start()
 
         items = get_all_items()
         if not items:
             self.set_status("No items tracked. Click '+ Add Item' to start.")
             return
+
+        # Batch-load all snapshots and history in 2 queries instead of N*2 connections
+        all_snapshots = get_all_price_snapshots()
+        all_histories = get_all_market_history_cache()
 
         for item in items:
             self.add_card(item["name"], color_hex=item["color_hex"])
@@ -187,7 +235,7 @@ class MainWindow(ctk.CTk):
                 if item.get("image_url"):
                     self._fetch_image_async(card, item["name"], item["image_url"])
                 # Restore last known prices (zero network — from local DB snapshot)
-                snap = get_price_snapshot(item["name"])
+                snap = all_snapshots.get(item["name"])
                 if snap:
                     if snap["ask"] is not None:
                         card.update_price({"status": "OK", "price": snap["ask"],
@@ -195,6 +243,10 @@ class MainWindow(ctk.CTk):
                     if snap["buy_highest"] is not None or snap["buy_count"]:
                         card.update_buy_orders({"highest_price": snap["buy_highest"],
                                                 "count": snap["buy_count"] or 0})
+                # Restore cached history graph if available (zero network)
+                cached_hist = all_histories.get(item["name"])
+                if cached_hist:
+                    card.update_graph(cached_hist["history"])
 
         self._run_price_cycle()
         # First orderbook fetch ~50s after startup (after the first price cycle),
@@ -230,6 +282,7 @@ class MainWindow(ctk.CTk):
             self.after(3_000, self._on_refresh_catalog)
         log.info("Catalog cache applied to %d cards.", updated)
         self._start_image_prewarm()
+        threading.Thread(target=item_catalog.get_seen_catalog, daemon=True).start()
 
     def _fetch_catalog_bg(self, force: bool):
         """Background thread: fetch catalog from Steam, then dispatch to main thread."""
@@ -254,6 +307,7 @@ class MainWindow(ctk.CTk):
         self._set_catalog_loading(False)
         log.info("Catalog applied to %d tracked cards (force=%s).", len(self._cards), force)
         self._start_image_prewarm()
+        threading.Thread(target=item_catalog.get_seen_catalog, daemon=True).start()
 
     def _set_catalog_loading(self, loading: bool):
         """Toggle refresh button state while catalog is being fetched."""
@@ -268,15 +322,37 @@ class MainWindow(ctk.CTk):
         self.set_status("Fetching latest catalog from Steam...")
         threading.Thread(target=self._fetch_catalog_bg, args=(True,), daemon=True).start()
 
-    # ── Savegame sync ─────────────────────────────────────────────────────────
+    # ── Savegame sync & Inspector ─────────────────────────────────────────────
 
     def _on_sync_save(self):
-        """Manual sync: re-read the local savegame file."""
+        """Manual sync: read from the saved path. If not set, prompt to select."""
+        from tkinter import filedialog
+
+        path = _cfg.get_save_path()
+        if not path or not os.path.exists(path):
+            # Fallback to file dialog
+            initial_dir = None
+            if path:
+                initial_dir = os.path.dirname(path)
+            else:
+                default_dir = os.path.dirname(save_reader.SAVE_PATH)
+                if os.path.exists(default_dir):
+                    initial_dir = default_dir
+
+            path = filedialog.askopenfilename(
+                title="Select Task Bar Hero Save File to Sync",
+                initialdir=initial_dir,
+                filetypes=[("Easy Save 3 Files", "*.es3;*.bak"), ("All Files", "*.*")]
+            )
+            if not path:
+                return  # User cancelled
+            _cfg.set_save_path(path)
+
         self._btn_sync_save.configure(text="...", state="disabled")
         self.set_status("Reading savegame...")
-        threading.Thread(target=self._sync_save_bg, daemon=True).start()
+        threading.Thread(target=self._sync_save_bg, args=(path,), daemon=True).start()
 
-    def _sync_save_bg(self):
+    def _sync_save_bg(self, path):
         """
         Background: decrypt local save (read-only, no network to Steam),
         map ItemKeys → market hash names, store result in items_owned.
@@ -284,7 +360,7 @@ class MainWindow(ctk.CTk):
         the Add Item dialog even if they have no active Steam Market listings.
         """
         try:
-            owned_counts = save_reader.get_owned_counts()
+            owned_counts = save_reader.get_owned_counts(path)
             # key_to_market_names works without items_seen — discovers sold-out items too
             owned = item_mapping.key_to_market_names(owned_counts)
             replace_owned_items(owned)
@@ -312,9 +388,91 @@ class MainWindow(ctk.CTk):
         self.after(0, lambda: self._on_sync_done(msg))
 
     def _on_sync_done(self, msg: str):
+        item_catalog.invalidate_seen_catalog_cache()
         self._btn_sync_save.configure(text="⇄ Sync", state="normal")
         self.set_status(msg)
         self.after(5000, lambda: self.set_status(""))
+
+    def _on_browse_save(self):
+        """Browse: prompt to select save file path, store it, and trigger sync."""
+        from tkinter import filedialog
+
+        saved_path = _cfg.get_save_path()
+        initial_dir = None
+        if saved_path:
+            initial_dir = os.path.dirname(saved_path)
+        else:
+            default_dir = os.path.dirname(save_reader.SAVE_PATH)
+            if os.path.exists(default_dir):
+                initial_dir = default_dir
+
+        path = filedialog.askopenfilename(
+            title="Select Task Bar Hero Save File",
+            initialdir=initial_dir,
+            filetypes=[("Easy Save 3 Files", "*.es3;*.bak"), ("All Files", "*.*")]
+        )
+        if not path:
+            return  # User cancelled
+
+        _cfg.set_save_path(path)
+        self.set_status("Save path updated.")
+        self._btn_sync_save.configure(text="...", state="disabled")
+        threading.Thread(target=self._sync_save_bg, args=(path,), daemon=True).start()
+
+    def _on_export_save(self):
+        """Decrypt the selected save file and export it as formatted JSON."""
+        from tkinter import filedialog, messagebox
+        import json
+
+        path = _cfg.get_save_path()
+        if not path or not os.path.exists(path):
+            messagebox.showwarning(
+                "Warning",
+                "Save game location has not been selected. Please click the 'Browse' button first."
+            )
+            return
+
+        initial_name = "decrypted_save.json"
+        dest_path = filedialog.asksaveasfilename(
+            title="Export Decrypted Save As JSON",
+            initialfile=initial_name,
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")]
+        )
+        if not dest_path:
+            return
+
+        try:
+            data = save_reader.decrypt_save(path)
+            with open(dest_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            messagebox.showinfo(
+                "Export Success",
+                f"Save game decrypted successfully and exported to:\n{dest_path}"
+            )
+            self.set_status("Save exported successfully.")
+            self.after(4000, lambda: self.set_status(""))
+        except Exception as exc:
+            log.exception("Export save game failed.")
+            messagebox.showerror(
+                "Export Failed",
+                f"An error occurred while decrypting/saving: {exc}"
+            )
+
+    def _on_open_save_inspector(self):
+        """Open the Save Inspector window using the saved path. Shows a warning if not set."""
+        from tkinter import messagebox
+        from .save_inspector import SaveInspectorWindow
+
+        path = _cfg.get_save_path()
+        if not path or not os.path.exists(path):
+            messagebox.showwarning(
+                "Warning",
+                "Save game location has not been selected. Please click the 'Browse' button first."
+            )
+            return
+
+        self._save_inspector_window = SaveInspectorWindow(self, path)
+
 
     # ── Price cycle ───────────────────────────────────────────────────────────
 
@@ -412,13 +570,35 @@ class MainWindow(ctk.CTk):
     def _on_listing_update(
         self, name, history, image_url, buy_orders, color_hex, item_type, item_nameid
     ):
-        """ListingWorker callback — metadata fields are always None (sourced from catalog)."""
+        """ListingWorker callback — metadata fields may be provided if listing was parsed."""
         def _update():
             card = self.get_card(name)
             if card is None:
                 return
 
             card.update_graph(history)
+
+            # Update metadata if extracted from listing page
+            if color_hex:
+                card.set_rarity_color(color_hex)
+            if item_type:
+                card.set_item_type(item_type)
+            if image_url:
+                self._fetch_image_async(card, name, image_url)
+
+            if color_hex or item_type or image_url:
+                item_db = get_item_by_name(name)
+                db_color = color_hex or (item_db["color_hex"] if item_db else "FFFFFF")
+                db_type = item_type or (item_db["item_type"] if item_db else "")
+                db_image = image_url or (item_db["image_url"] if item_db else None)
+                update_item_metadata(name, db_color, db_type, db_image, None)
+                upsert_seen_items([{
+                    "hash_name": name,
+                    "item_type": db_type,
+                    "color_hex": db_color,
+                    "icon_url": db_image
+                }])
+                item_catalog.invalidate_seen_catalog_cache()
 
             # Orderbook currency follows Steam geo-IP, not our setting —
             # only display when it matches the selected currency.
@@ -518,7 +698,6 @@ class MainWindow(ctk.CTk):
     # ── Card management ───────────────────────────────────────────────────────
 
     def add_card(self, item_name: str, color_hex: str = "FFFFFF"):
-        from .item_card import ItemCard
         if item_name in self._cards:
             return
         self._empty_label.grid_remove()
@@ -529,6 +708,7 @@ class MainWindow(ctk.CTk):
     def remove_card(self, item_name: str):
         card = self._cards.pop(item_name, None)
         if card:
+            card.cleanup()
             card.destroy()
         if not self._cards:
             self._empty_label.grid()
@@ -607,6 +787,7 @@ class MainWindow(ctk.CTk):
         clear_price_history()
         clear_price_snapshots()
         log.info("Currency changed to %s. Price history and snapshots cleared.", choice)
+        self.after(0, self._run_price_cycle)
 
     # ── Closing ───────────────────────────────────────────────────────────────
 
@@ -615,4 +796,5 @@ class MainWindow(ctk.CTk):
         for worker in (self._price_worker, self._listing_worker, self._prewarm_thread):
             if worker and worker.is_alive():
                 worker.join(timeout=3)
+        run_optimize()
         self.destroy()

@@ -90,3 +90,16 @@ def set_currency(code: str) -> None:
     cfg = _load()
     cfg["currency_code"] = code
     _save()
+
+
+def get_save_path() -> str:
+    """Return the saved savegame file path, or None if not set."""
+    return _load().get("save_path")
+
+
+def set_save_path(path: str) -> None:
+    """Persist the savegame file path to configuration."""
+    cfg = _load()
+    cfg["save_path"] = path
+    _save()
+

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Callable, List
 
 from .steam_api import SteamMarketAPI
+from .database import get_market_history_cache, save_market_history_cache, get_cached_image
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +111,43 @@ class ListingWorker(_BaseWorker):
                 log.info("ListingWorker stopped.")
                 return
 
+            # Check market history database cache
+            cached = get_market_history_cache(name)
+            use_cache = False
+            history = []
+            image_url = None
+            color_hex = None
+            item_type = None
+
+            # Only use cached history if the image is also cached locally.
+            # If the image is missing, we must fetch the listing page to get the image URL.
+            has_image = bool(get_cached_image(name))
+
+            if cached and has_image:
+                updated_at = datetime.fromisoformat(cached["updated_at"])
+                age = datetime.now() - updated_at
+                if age < timedelta(hours=1):
+                    use_cache = True
+                    history = cached["history"]
+                    log.info("Using cached market history for %s (age: %.1f min). Skip Steam request.", name, age.total_seconds() / 60)
+
+            if not use_cache:
+                listing_data = self._api.get_listing_data(name)
+                fresh_history = listing_data.get("history", [])
+                if fresh_history:
+                    history = fresh_history
+                    save_market_history_cache(name, history)
+                else:
+                    # If fetching failed or returned empty, reuse stale cache if available
+                    if cached:
+                        history = cached["history"]
+                        log.warning("Steam history fetch returned empty for %s; falling back to stale cache.", name)
+                    else:
+                        history = []
+                image_url = listing_data.get("image_url")
+                color_hex = listing_data.get("name_color")
+                item_type = listing_data.get("item_type")
+
             orderbook = self._api.get_orderbook(name)
             log.debug("Orderbook %-28s → %s", name, orderbook)
 
@@ -121,11 +159,11 @@ class ListingWorker(_BaseWorker):
 
             self._on_update(
                 name,
-                [],             # history: no longer publicly available
-                None,           # image_url: sourced from catalog
+                history,
+                image_url,
                 buy_orders,
-                None,           # color_hex: sourced from catalog
-                None,           # item_type: sourced from catalog
+                color_hex,
+                item_type,
                 None,           # item_nameid: dead since Steam redesign
             )
 

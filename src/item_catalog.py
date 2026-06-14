@@ -71,6 +71,8 @@ _cache: List[CatalogItem] = []
 _ready = False
 _fetching = False   # True while a catalog fetch is hitting Steam (pause other requests)
 
+_seen_catalog_cache: Optional[List["SeenItem"]] = None  # invalidated on any items_seen/owned change
+
 
 # ── Catalog cache I/O (JSON, 24h TTL) ────────────────────────────────────────
 
@@ -128,6 +130,13 @@ def cache_age_str() -> str:
 
 # ── Seen-items DB (SQLite) ────────────────────────────────────────────────────
 
+def invalidate_seen_catalog_cache() -> None:
+    """Mark the seen-catalog cache as stale. Call after any items_seen or items_owned change."""
+    global _seen_catalog_cache
+    with _lock:
+        _seen_catalog_cache = None
+
+
 def _merge_seen(catalog_items: List[CatalogItem]) -> None:
     """
     Upsert catalog_items into the items_seen SQLite table.
@@ -143,6 +152,7 @@ def _merge_seen(catalog_items: List[CatalogItem]) -> None:
         for item in catalog_items
     ]
     upsert_seen_items(rows)
+    invalidate_seen_catalog_cache()
     log.info("Seen-items DB: merged %d items.", len(rows))
 
 
@@ -319,7 +329,14 @@ def get_seen_catalog() -> List[SeenItem]:
     All ever-seen items from SQLite, enriched with current availability
     and owned count from the last savegame sync.
     Sort: available first (A→Z), then sold-out (A→Z).
+    Result is cached in memory; call invalidate_seen_catalog_cache() after any DB change.
     """
+    global _seen_catalog_cache
+    with _lock:
+        if _seen_catalog_cache is not None:
+            log.debug("get_seen_catalog: cache hit (%d items).", len(_seen_catalog_cache))
+            return list(_seen_catalog_cache)
+
     rows = get_all_seen_items()
     current_names = {item.hash_name for item in get_catalog()}
     owned = get_owned_items()
@@ -336,7 +353,11 @@ def get_seen_catalog() -> List[SeenItem]:
         for row in rows
     ]
     result.sort(key=lambda x: (not x.available, x.hash_name.lower()))
-    return result
+
+    with _lock:
+        _seen_catalog_cache = result
+    log.debug("get_seen_catalog: cache built (%d items).", len(result))
+    return list(result)
 
 
 def is_ready() -> bool:

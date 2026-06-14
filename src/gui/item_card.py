@@ -2,11 +2,13 @@ import io
 import logging
 import urllib.parse
 import webbrowser
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 import customtkinter as ctk
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.ticker import FuncFormatter
 from PIL import Image
 
 from .. import config as _cfg
@@ -47,6 +49,7 @@ class ItemCard(ctk.CTkFrame):
         self._color_hex = color_hex
         self._on_delete = on_delete
         self._currency_symbol = _cfg.get_currency_symbol()
+        self._current_price_selected = None
         self._ctk_image = None
         self._fig = None
         self._ax = None
@@ -182,13 +185,37 @@ class ItemCard(ctk.CTkFrame):
         )
         self._graph_placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
-        ctk.CTkLabel(
+        self._currency_label = ctk.CTkLabel(
             self._graph_slot,
-            text="USD",
+            text=self._currency_symbol,
             font=ctk.CTkFont(size=8),
             text_color="gray40",
             fg_color="transparent",
-        ).place(relx=1.0, rely=1.0, anchor="se", x=-4, y=-2)
+        )
+        self._currency_label.place(relx=1.0, rely=1.0, anchor="se", x=-4, y=-2)
+
+        # ── Time range filters ────────────────────────────────────────────────
+        self._active_range = "Lifetime"
+        self._filter_frame = ctk.CTkFrame(self._graph_slot, fg_color="transparent")
+        self._filter_frame.place(relx=1.0, rely=0.0, anchor="ne", x=-6, y=2)
+
+        self._filter_buttons = {}
+        for r_name in ["Week", "Month", "Year", "Lifetime"]:
+            btn = ctk.CTkButton(
+                self._filter_frame,
+                text=r_name,
+                width=34, height=14,
+                font=ctk.CTkFont(size=8),
+                fg_color="transparent",
+                text_color="gray65",
+                hover_color="gray30",
+                corner_radius=2,
+                command=lambda name=r_name: self._on_range_change(name)
+            )
+            btn.pack(side="left", padx=1)
+            self._filter_buttons[r_name] = btn
+
+        self._update_filter_buttons_ui()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -229,6 +256,8 @@ class ItemCard(ctk.CTkFrame):
             return
 
         price = result["price"]
+        prev_price = self._current_price_selected
+        self._current_price_selected = price
         sym = self._currency_symbol
         self._price_label.configure(text=f"{sym} {price:,.0f}", text_color="white")
         self._set_trend(price, last_price)
@@ -241,6 +270,11 @@ class ItemCard(ctk.CTkFrame):
         if volume is not None:
             parts.append(f"Vol  {volume:,}/day")
         self._meta_label.configure(text="   ·   ".join(parts))
+
+        # Only redraw graph when price changed — exchange rate (IDR/USD) is derived from price,
+        # so no price change means no change in graph scaling.
+        if hasattr(self, "_history") and self._history and price != prev_price:
+            self.update_graph(self._history)
 
     def update_buy_orders(self, buy_orders: dict):
         """
@@ -274,10 +308,17 @@ class ItemCard(ctk.CTkFrame):
         Must be called from the main thread.
         """
         self._currency_symbol = symbol
+        self._current_price_selected = None
         self._price_label.configure(text="—", text_color="white")
         self._trend_label.configure(text="")
         self._meta_label.configure(text="")
         self._buy_label.configure(text="—", text_color="#4a9eff")
+        if hasattr(self, "_currency_label") and self._currency_label:
+            self._currency_label.configure(text=symbol)
+
+        # Redraw the graph to reflect USD fallback immediately (since selected price is None)
+        if hasattr(self, "_history") and self._history:
+            self.update_graph(self._history)
 
     def hide_graph_placeholder(self):
         self._graph_placeholder.place_forget()
@@ -288,16 +329,121 @@ class ItemCard(ctk.CTkFrame):
         history: list of [date_str, price_usd, volume] from Steam line1.
         Must be called from the main thread.
         """
+        self._history = history
+
         if self._mpl_canvas is None:
             self._create_graph()
 
-        prices = [row[1] for row in history] if history else []
         self._ax.clear()
         self._ax.set_facecolor(_GRAPH_BG)
 
-        if prices:
-            self._ax.plot(prices, color="#4a9eff", linewidth=0.9, antialiased=True)
+        if not hasattr(self, "_ax2"):
+            self._ax2 = self._ax.twinx()
+        else:
+            self._ax2.clear()
+
+        self._ax2.set_facecolor("none")
+        for spine in self._ax2.spines.values():
+            spine.set_visible(False)
+        self._ax2.set_xticks([])
+        self._ax2.set_yticks([])
+
+        # Calculate exchange rate from USD to target currency if active price exists
+        exchange_rate = 1.0
+        graph_currency_symbol = "$"
+        if self._current_price_selected is not None and history:
+            last_hist_price = history[-1][1]
+            if last_hist_price > 0:
+                exchange_rate = self._current_price_selected / last_hist_price
+                graph_currency_symbol = self._currency_symbol
+
+        self._exchange_rate = exchange_rate
+        self._graph_currency_symbol = graph_currency_symbol
+
+        # Filter history by selected range
+        def parse_date(d_str):
+            try:
+                return datetime.strptime(d_str, "%b %d %Y %H:%M:%S +00").replace(tzinfo=timezone.utc)
+            except Exception:
+                return None
+
+        filtered = history
+        if history and self._active_range != "Lifetime":
+            now = datetime.now(timezone.utc)
+            if self._active_range == "Week":
+                cutoff = now - timedelta(days=7)
+            elif self._active_range == "Month":
+                cutoff = now - timedelta(days=30)
+            elif self._active_range == "Year":
+                cutoff = now - timedelta(days=365)
+            else:
+                cutoff = None
+
+            if cutoff:
+                filtered = [row for row in history if (parse_date(row[0]) or now) >= cutoff]
+                # If filter results in too few points, fallback to all to avoid empty chart
+                if len(filtered) < 2:
+                    filtered = history
+
+        self._plotted_data = filtered
+
+        if filtered:
+            prices = [row[1] * exchange_rate for row in filtered]
+            volumes = [row[2] if row[2] is not None else 0 for row in filtered]
+
+            # 1. Plot volume bars (blue, transparency, squashed to bottom 25%)
+            self._ax2.bar(range(len(volumes)), volumes, color="#478cbd", alpha=0.3, width=0.8)
+            max_vol = max(volumes) if volumes and any(volumes) else 1
+            self._ax2.set_ylim(0, max_vol * 4)
+
+            # 2. Plot price line (green color matching Steam, with shaded area)
+            self._ax.plot(range(len(prices)), prices, color="#A5C33A", linewidth=1.2, antialiased=False)
+            self._ax.fill_between(range(len(prices)), prices, color="#A5C33A", alpha=0.12)
             self._ax.margins(x=0.01, y=0.15)
+
+            # 3. Style Y axis (price labels in selected currency on the left)
+            self._ax.yaxis.tick_left()
+            self._ax.tick_params(axis='y', colors='gray', labelsize=6.5, length=2, pad=2)
+            def y_fmt(val, pos):
+                return f"{graph_currency_symbol}{val:,.0f}"
+            self._ax.yaxis.set_major_formatter(FuncFormatter(y_fmt))
+
+            # 4. Style X axis (dates at the bottom)
+            if len(prices) > 1:
+                tick_indices = [0, len(prices) // 2, len(prices) - 1]
+                tick_labels = []
+                for idx in tick_indices:
+                    date_str = filtered[idx][0]
+                    try:
+                        dt = datetime.strptime(date_str, "%b %d %Y %H:%M:%S +00")
+                        tick_labels.append(dt.strftime("%d/%m"))
+                    except Exception:
+                        tick_labels.append(date_str[:6])
+                self._ax.set_xticks(tick_indices)
+                self._ax.set_xticklabels(tick_labels, color='gray', fontsize=6.5)
+                self._ax.tick_params(axis='x', colors='gray', labelsize=6.5, length=2, pad=2)
+            else:
+                self._ax.set_xticks([])
+                self._ax.set_xticklabels([])
+
+            # 5. Enable grid lines behind plot
+            self._ax.grid(True, which='both', axis='both', color='#2d2d2d', linestyle='-', linewidth=0.5)
+            self._ax.set_axisbelow(True)
+
+            # 6. Create hover visual elements
+            self._hover_vline = self._ax.axvline(x=0, color="#ffffff", linestyle="--", linewidth=0.8, visible=False)
+            self._hover_point = self._ax.plot([], [], 'o', color='#A5C33A', markersize=4, visible=False)[0]
+            self._tooltip = self._ax.annotate(
+                "",
+                xy=(0, 0),
+                xycoords=('data', 'axes fraction'),
+                xytext=(10, 0),
+                textcoords="offset points",
+                bbox=dict(boxstyle="round,pad=0.5", fc="#2a2a2a", ec="gray", lw=0.5, alpha=0.95),
+                fontsize=7.5,
+                color="white",
+                visible=False,
+            )
         else:
             self._ax.text(
                 0.5, 0.5, "No history data",
@@ -305,25 +451,146 @@ class ItemCard(ctk.CTkFrame):
                 transform=self._ax.transAxes,
                 color="gray", fontsize=7,
             )
+            self._ax.set_xticks([])
+            self._ax.set_yticks([])
 
         for spine in self._ax.spines.values():
             spine.set_visible(False)
-        self._ax.set_xticks([])
-        self._ax.set_yticks([])
-        self._mpl_canvas.draw()
+        self._mpl_canvas.draw_idle()
+
+        # Lift controls to make sure they are not covered by the canvas
+        self._filter_frame.lift()
+        if hasattr(self, "_currency_label") and self._currency_label:
+            self._currency_label.configure(text=graph_currency_symbol)
+            self._currency_label.lift()
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _create_graph(self):
         """Build the matplotlib figure and embed it in the graph slot frame."""
         self._fig = Figure(figsize=(5, 0.9), dpi=80, facecolor=_GRAPH_BG)
-        self._fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        # Allocate space for labels, leaving top 24% empty for filter buttons
+        self._fig.subplots_adjust(left=0.08, right=0.97, top=0.76, bottom=0.18)
         self._ax = self._fig.add_subplot(111)
         self._ax.set_facecolor(_GRAPH_BG)
 
         self._mpl_canvas = FigureCanvasTkAgg(self._fig, master=self._graph_slot)
         self._mpl_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
         self.hide_graph_placeholder()
+
+        # Lift controls above canvas
+        self._filter_frame.lift()
+        if hasattr(self, "_currency_label") and self._currency_label:
+            self._currency_label.lift()
+
+        # Bind hover events
+        self._fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
+        self._fig.canvas.mpl_connect("axes_leave_event", self._on_leave)
+
+    def _on_hover(self, event):
+        if not hasattr(self, "_plotted_data") or not self._plotted_data:
+            self._hide_hover_elements()
+            return
+
+        if event.inaxes not in [self._ax, getattr(self, "_ax2", None)]:
+            self._hide_hover_elements()
+            return
+
+        x = event.xdata
+        if x is None:
+            self._hide_hover_elements()
+            return
+
+        idx = int(round(x))
+        if idx < 0 or idx >= len(self._plotted_data):
+            self._hide_hover_elements()
+            return
+
+        # Fetch datapoint values
+        date_str, price, volume = self._plotted_data[idx]
+        volume_val = volume if volume is not None else 0
+
+        # Get active scaling parameters
+        exchange_rate = getattr(self, "_exchange_rate", 1.0)
+        graph_currency_symbol = getattr(self, "_graph_currency_symbol", "$")
+        price_converted = price * exchange_rate
+
+        # Format price based on currency type (no decimals for Rp, ₩, ₫, ¥)
+        is_integer_currency = graph_currency_symbol in ["Rp", "₫", "₩", "¥"]
+        if is_integer_currency:
+            price_str = f"{price_converted:,.0f}"
+        else:
+            price_str = f"{price_converted:,.2f}"
+
+        # Format datetime to a user-friendly format (English)
+        try:
+            dt = datetime.strptime(date_str, "%b %d %Y %H:%M:%S +00")
+            formatted_date = dt.strftime("%A, %b %d, %Y")
+        except Exception:
+            formatted_date = date_str
+
+        text = f"{formatted_date}\nMedian Price: {graph_currency_symbol} {price_str}\nVolume: {volume_val:,}"
+
+        # Update vertical cursor line
+        if hasattr(self, "_hover_vline"):
+            self._hover_vline.set_xdata([idx, idx])
+            self._hover_vline.set_visible(True)
+
+        # Update hover dot on price curve
+        if hasattr(self, "_hover_point"):
+            self._hover_point.set_data([idx], [price_converted])
+            self._hover_point.set_visible(True)
+
+        # Update tooltip location and content
+        if hasattr(self, "_tooltip"):
+            self._tooltip.xy = (idx, 0.45)
+            self._tooltip.set_text(text)
+            self._tooltip.set_visible(True)
+
+            # Prevent clipping and overlapping with the top-right range buttons
+            if idx > len(self._plotted_data) * 0.5:
+                self._tooltip.set_horizontalalignment('right')
+                self._tooltip.set_verticalalignment('center')
+                self._tooltip.set_position((-12, 0))
+            else:
+                self._tooltip.set_horizontalalignment('left')
+                self._tooltip.set_verticalalignment('center')
+                self._tooltip.set_position((12, 0))
+
+        self._mpl_canvas.draw_idle()
+
+    def _on_leave(self, event):
+        self._hide_hover_elements()
+
+    def _hide_hover_elements(self):
+        updated = False
+        if hasattr(self, "_hover_vline") and self._hover_vline.get_visible():
+            self._hover_vline.set_visible(False)
+            updated = True
+        if hasattr(self, "_hover_point") and self._hover_point.get_visible():
+            self._hover_point.set_visible(False)
+            updated = True
+        if hasattr(self, "_tooltip") and self._tooltip.get_visible():
+            self._tooltip.set_visible(False)
+            updated = True
+
+        if updated and self._mpl_canvas:
+            self._mpl_canvas.draw_idle()
+
+    def _on_range_change(self, range_name: str):
+        if self._active_range == range_name:
+            return
+        self._active_range = range_name
+        self._update_filter_buttons_ui()
+        if hasattr(self, "_history") and self._history:
+            self.update_graph(self._history)
+
+    def _update_filter_buttons_ui(self):
+        for name, btn in self._filter_buttons.items():
+            if name == self._active_range:
+                btn.configure(fg_color=("#2d2d2d", "#2d2d2d"), text_color="white")
+            else:
+                btn.configure(fg_color="transparent", text_color="gray65")
 
     def _set_trend(self, current: float, last: Optional[float]):
         if last is None:
@@ -340,6 +607,13 @@ class ItemCard(ctk.CTkFrame):
     def _open_market_page(self, _event=None):
         market_url = _MARKET_BASE + urllib.parse.quote(self._item_name, safe="")
         webbrowser.open(f"steam://openurl/{market_url}")
+
+    def cleanup(self):
+        """Close the matplotlib figure, removing it from the global figure registry."""
+        if self._fig is not None:
+            from matplotlib import pyplot as plt
+            plt.close(self._fig)
+            self._fig = None
 
     def _handle_delete(self):
         if self._on_delete:

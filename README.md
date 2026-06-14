@@ -108,6 +108,12 @@ This tool assists players in monitoring item price trends, tracking owned items 
 
 ## How to Run
 
+You can run this application using one of the following two methods:
+
+### Method 1: Using the Startup Shortcut (Double-Click)
+For convenience on Windows, you can double-click the **`run.bat`** file located at the project root. This script will automatically detect the virtual environment `.venv` and launch the application in the background without keeping a console window open.
+
+### Method 2: Running via Terminal
 1. **Start the Application**:
    Ensure your virtual environment is active, then execute:
    ```bash
